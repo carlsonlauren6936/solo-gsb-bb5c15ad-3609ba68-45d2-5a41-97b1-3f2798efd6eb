@@ -702,8 +702,14 @@ def allocate_payment(
 
     分配顺序：``due_date`` 升序（未设置到期日的排最后）、同一到期日按发票 ID
     升序；只处理 ``invoice_ids`` 中的发票，不做跨币种换算。按顺序逐张抵扣：
-    每张分配 ``min(剩余来款, 该发票未收余额)``，来款用尽即止。未收余额按
+    每张分配 ``min(剩余来款, 该发票正未收余额)``，来款用尽即止。未收余额按
     **净入账额**（收款 − 冲销）计算，冲销释放的余额可以再次被分配。
+
+    **负额冲红 / 已结清发票不参与抵扣**：未收余额 ≤ 0 的候选发票（负数冲红单、
+    已收满的发票）在结果中分配 ``0``（``payment_id`` 为 ``null``），既不消耗
+    也不增加剩余来款；可分配余额合计同样只计入**正未收额**。若把负未收余额当作
+    分配额，剩余来款会被越滚越大（如 50.00 来款最终写入 150.00 收款），批次
+    金额与实际入账不符——本函数保证成功时各笔收款合计恒等于来款金额。
 
     **混合精度**：币种代码相同只代表币种一致，各发票保存的 ``currency_digits``
     可能不同（币种精度配置变更后，旧发票保留旧位数、新发票按新位数保存）。因此
@@ -732,7 +738,8 @@ def allocate_payment(
     * 按实际抵扣顺序计算出的某张发票实际分配额（>0）不是**该发票保存的**
       ``currency_digits`` 最小单位整数倍（整笔无法按各发票精度精确分配）
       -> ``ValueError``
-    * 列表内发票未收余额合计 < 来款金额 -> ``ValueError``
+    * 列表内发票**正未收余额**合计 < 来款金额（负额冲红与已结清发票不计入）
+      -> ``ValueError``
     """
 
     batch_id: int | None = None
@@ -781,11 +788,18 @@ def allocate_payment(
                     invoice_id, Decimal("0")
                 )
 
-            total_outstanding = sum(outstanding.values(), Decimal("0"))
+            # 可分配余额只计入**正未收额**：负额冲红发票（未收余额为负）与
+            # 已结清发票（未收余额为 0）不参与抵扣。若把负余额计入合计，既会
+            # 虚减可分配总额，又会在下面的抵扣循环中被当作分配额、把剩余来款
+            # 越滚越大（50.00 来款可能写入 150.00 收款）。
+            total_outstanding = sum(
+                (due for due in outstanding.values() if due > 0), Decimal("0")
+            )
             if amount > total_outstanding:
                 raise ValueError(
-                    f"来款 {amount} {currency} 超出列表内发票未收余额合计 "
-                    f"{format(total_outstanding, 'f')}，整笔拒绝，未登记任何记录"
+                    f"来款 {amount} {currency} 超出列表内发票正未收余额合计 "
+                    f"{format(total_outstanding, 'f')}"
+                    f"（负额冲红与已结清发票不参与抵扣），整笔拒绝，未登记任何记录"
                 )
 
             # 到期日升序、NULL 排最后（is None -> True=1）；同日（含都为空）按 ID 升序
@@ -802,7 +816,12 @@ def allocate_payment(
             remaining = amount
             for invoice_id in ordered_ids:
                 due = outstanding[invoice_id]
-                allocated = remaining if remaining < due else due
+                if due <= 0:
+                    # 负额冲红 / 已结清发票：分配 0，不消耗也不增加剩余来款；
+                    # 结果中仍按抵扣顺序回显（allocated 为 0、payment_id 为 null）
+                    allocated = Decimal("0")
+                else:
+                    allocated = remaining if remaining < due else due
                 item_digits = digits_by_id[invoice_id]
                 item_unit = _minor_unit(item_digits)
                 if allocated > 0 and (allocated / item_unit) != (
@@ -829,8 +848,8 @@ def allocate_payment(
                 )
                 remaining -= allocated
             if remaining != 0:
-                # 不变量防御：上面已校验总未收充足、且逐张分配额均为各自最小单位
-                # 整数倍，理论上不可能有剩余
+                # 不变量防御：上面已校验正未收合计充足、且逐张分配额均为各自
+                # 最小单位整数倍，理论上不可能有剩余
                 raise AssertionError(
                     f"来款分配后仍有余额 {format(remaining, 'f')} 未抵扣"
                 )

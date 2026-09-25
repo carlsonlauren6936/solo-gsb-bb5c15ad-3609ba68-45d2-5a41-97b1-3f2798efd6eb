@@ -258,7 +258,8 @@ class PaymentAllocationCreate(BaseModel):
     invoice_ids: list[int] = Field(
         min_length=1,
         description="待结发票 ID 列表，不得重复；只处理列表内发票，"
-        "实际按到期日升序（无到期日排最后）、同日按 ID 升序逐张抵扣",
+        "实际按到期日升序（无到期日排最后）、同日按 ID 升序逐张抵扣；"
+        "负额冲红或已结清（未收余额 ≤ 0）的发票分配 0，不消耗也不增加剩余来款",
     )
 
     @field_validator("currency")
