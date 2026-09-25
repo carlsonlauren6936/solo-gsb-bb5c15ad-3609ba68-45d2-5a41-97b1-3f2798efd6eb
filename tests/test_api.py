@@ -3285,5 +3285,163 @@ class ApiTests(unittest.TestCase):
                 os.environ["CURRENCY_DIGITS"] = old_env
 
 
+    def test_49_allocation_skips_negative_and_settled_invoices(self) -> None:
+        # 候选发票含负额冲红单时，可分配余额只计入正未收额：负额/已结清发票
+        # 分配 0（不消耗也不增加剩余来款、不产生收款），正额发票仍按到期日/ID
+        # 顺序抵扣；正未收合计不足 -> 422，批次与收款均不落库。
+        import sqlite3
+
+        db_file = os.environ["DB_PATH"]
+
+        def make_usd(net: str, due_date: str | None) -> int:
+            payload = {"currency": "USD", "lines": [{"net": net, "tax_rate": "0"}]}
+            if due_date is not None:
+                payload["due_date"] = due_date
+            status, inv = self._request("POST", "/api/v1/invoices", payload)
+            self.assertEqual(status, 201, inv)
+            return inv["id"]
+
+        def batch_count() -> int:
+            c = sqlite3.connect(db_file, timeout=30)
+            try:
+                return int(
+                    c.execute("SELECT COUNT(*) FROM payment_allocation_batches")
+                    .fetchone()[0]
+                )
+            finally:
+                c.close()
+
+        # 冲红单 N：gross -100.00，最早到期（若按旧逻辑会先吞掉负的未收余额）
+        # 正额发票 P：gross 50.00，更晚到期
+        id_neg = make_usd("-100.00", "2026-09-01")
+        id_pos = make_usd("50.00", "2026-09-10")
+        batches_before = batch_count()
+
+        # 场景 1（回归）：50.00 来款 —— 冲红单分配 0、P 收满 50.00，
+        # allocated_total 必须恰为 50.00（旧实现会在冲红单上误写收款）
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "50.00",
+             "invoice_ids": [id_pos, id_neg]},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["amount"], "50.00")
+        self.assertEqual(body["allocated_total"], "50.00")
+        self.assertEqual(
+            [(it["invoice_id"], it["allocated"], it["outstanding"],
+              it["payment_id"] is not None)
+             for it in body["allocations"]],
+            [(id_neg, "0.00", "-100.00", False),
+             (id_pos, "50.00", "0.00", True)],
+        )
+        # 实际收款合计恰好等于来款金额
+        from decimal import Decimal
+        self.assertEqual(
+            str(sum(Decimal(it["allocated"]) for it in body["allocations"])),
+            "50.00",
+        )
+        # 冲红单没有任何收款流水
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_neg}/payments")
+        self.assertEqual(status, 200)
+        self.assertEqual(ov["payment_count"], 0)
+        self.assertEqual(ov["outstanding"], "-100.00")
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_pos}/payments")
+        self.assertEqual(status, 200)
+        self.assertEqual(ov["payment_count"], 1)
+        self.assertEqual(ov["paid_total"], "50.00")
+        self.assertEqual(ov["outstanding"], "0.00")
+
+        # 批次明细只含实际产生的一笔收款（冲红单不进批次明细）
+        c = sqlite3.connect(db_file, timeout=30)
+        try:
+            item_rows = c.execute(
+                "SELECT invoice_id, allocated FROM payment_allocation_batch_items"
+                " WHERE batch_id = ? ORDER BY seq",
+                (body["batch_id"],),
+            ).fetchall()
+        finally:
+            c.close()
+        self.assertEqual([(r[0], r[1]) for r in item_rows], [(id_pos, "50.00")])
+
+        # 场景 2：正未收合计不足（P 已结清，列表只剩冲红单）-> 422 不落库
+        status, resp = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "0.01",
+             "invoice_ids": [id_neg, id_pos]},
+        )
+        self.assertEqual(status, 422, resp)
+        self.assertIn("正未收余额合计", resp["detail"])
+        self.assertEqual(batch_count(), batches_before + 1)  # 批次未新增
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_pos}/payments")
+        self.assertEqual(ov["payment_count"], 1)  # 仍是原来的 50.00
+
+        # 场景 3：冲红单 + 新正额发票 Q(gross 30.00)，来款 30.01 超过正未收
+        id_q = make_usd("30.00", "2026-09-15")
+        status, resp = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "30.01",
+             "invoice_ids": [id_neg, id_q]},
+        )
+        self.assertEqual(status, 422, resp)
+        self.assertEqual(batch_count(), batches_before + 1)
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_q}/payments")
+        self.assertEqual(ov["payment_count"], 0)
+        # 冲红单依旧没有流水
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_neg}/payments")
+        self.assertEqual(ov["payment_count"], 0)
+
+        # 场景 4：部分抵扣——来款 20.00：冲红单 0、Q 抵 20.00 余 10.00
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "20.00",
+             "invoice_ids": [id_q, id_neg]},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["allocated_total"], "20.00")
+        self.assertEqual(
+            [(it["invoice_id"], it["allocated"], it["outstanding"],
+              it["payment_id"] is not None)
+             for it in body["allocations"]],
+            [(id_neg, "0.00", "-100.00", False),
+             (id_q, "20.00", "10.00", True)],
+        )
+
+        # 场景 5：已结清发票（P）与冲红单同列，来款抵剩余的 Q(10.00)；
+        # 已结清发票分配 0、回显 outstanding "0.00"，顺序仍为 N -> P -> Q
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "10.00",
+             "invoice_ids": [id_q, id_pos, id_neg]},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["allocated_total"], "10.00")
+        self.assertEqual(
+            [(it["invoice_id"], it["allocated"], it["outstanding"],
+              it["payment_id"] is not None)
+             for it in body["allocations"]],
+            [(id_neg, "0.00", "-100.00", False),
+             (id_pos, "0.00", "0.00", False),
+             (id_q, "10.00", "0.00", True)],
+        )
+
+        # 整批撤销只冲 Q 的两笔收款，与冲红单/已结清发票无关
+        status, rev = self._request(
+            "POST",
+            f"/api/v1/payment-allocation-batches/{body['batch_id']}/reversals",
+        )
+        self.assertEqual(status, 201, rev)
+        self.assertEqual(rev["reversed_total"], "10.00")
+        self.assertEqual(
+            [(it["invoice_id"], it["allocated"], it["reversed_amount"])
+             for it in rev["items"]],
+            [(id_q, "10.00", "10.00")],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

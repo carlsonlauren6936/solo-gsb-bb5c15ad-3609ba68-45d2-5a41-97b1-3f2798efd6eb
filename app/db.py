@@ -705,6 +705,12 @@ def allocate_payment(
     每张分配 ``min(剩余来款, 该发票未收余额)``，来款用尽即止。未收余额按
     **净入账额**（收款 − 冲销）计算，冲销释放的余额可以再次被分配。
 
+    **负额/已结清发票**：计算可分配余额时**只计入正未收额**——负额冲红单
+    （含税总额为负、未收余额 < 0）与已结清发票（未收余额 = 0）在结果中分配
+    ``0``，**不消耗也不增加**剩余来款，不产生收款流水，仍按到期日/ID 顺序
+    出现在响应里并回显其（负）未收余额。正未收额合计不足来款金额时整笔
+    ``422``，批次与收款均不落库；成功时各发票实际收款合计恰好等于来款金额。
+
     **混合精度**：币种代码相同只代表币种一致，各发票保存的 ``currency_digits``
     可能不同（币种精度配置变更后，旧发票保留旧位数、新发票按新位数保存）。因此
     整笔来款**不按某一张发票的精度统一校验**，而是先按实际抵扣顺序算出完整分配
@@ -729,10 +735,10 @@ def allocate_payment(
     * 列表中任一发票不存在 -> :class:`InvoiceNotFoundError`
     * 来款金额 ≤ 0 -> ``ValueError``
     * 发票币种与来款不一致 -> ``ValueError``
-    * 按实际抵扣顺序计算出的某张发票实际分配额（>0）不是**该发票保存的**
+    * 按实际抵扣顺序计算出的某张正未收额发票实际分配额（>0）不是**该发票保存的**
       ``currency_digits`` 最小单位整数倍（整笔无法按各发票精度精确分配）
       -> ``ValueError``
-    * 列表内发票未收余额合计 < 来款金额 -> ``ValueError``
+    * 列表内发票**正未收额合计**（负额/已结清发票不计入）< 来款金额 -> ``ValueError``
     """
 
     batch_id: int | None = None
@@ -781,11 +787,24 @@ def allocate_payment(
                     invoice_id, Decimal("0")
                 )
 
-            total_outstanding = sum(outstanding.values(), Decimal("0"))
+            # **可分配余额只计入正未收额**：负额冲红发票（含税总额为负，未收
+            # 余额 < 0）与已结清/超收发票（未收余额 = 0）都不是待结发票——
+            # 它们既不消耗也不增加剩余来款，绝不能把负的未收余额当作分配额
+            # （否则 50.00 来款会在 -100.00 冲红单上写出 50.00 收款、批次合计
+            # 与实际入账不符）。正未收额合计不足即整笔拒绝。
+            positive_outstanding = {
+                invoice_id: due
+                for invoice_id, due in outstanding.items()
+                if due > 0
+            }
+            total_outstanding = sum(
+                positive_outstanding.values(), Decimal("0")
+            )
             if amount > total_outstanding:
                 raise ValueError(
-                    f"来款 {amount} {currency} 超出列表内发票未收余额合计 "
-                    f"{format(total_outstanding, 'f')}，整笔拒绝，未登记任何记录"
+                    f"来款 {amount} {currency} 超出列表内发票正未收余额合计 "
+                    f"{format(total_outstanding, 'f')}"
+                    f"（负额冲红单与已结清发票不可抵扣），整笔拒绝，未登记任何记录"
                 )
 
             # 到期日升序、NULL 排最后（is None -> True=1）；同日（含都为空）按 ID 升序
@@ -802,9 +821,22 @@ def allocate_payment(
             remaining = amount
             for invoice_id in ordered_ids:
                 due = outstanding[invoice_id]
-                allocated = remaining if remaining < due else due
                 item_digits = digits_by_id[invoice_id]
                 item_unit = _minor_unit(item_digits)
+                # 未收余额 ≤ 0（负额冲红单、已结清）的发票本次分配 0：不消耗
+                # 也不增加剩余来款，原样回显其（负）未收余额且不产生收款流水。
+                # 只有正未收额发票才按到期日/ID 顺序参与抵扣。
+                if due <= 0:
+                    plan.append(
+                        {
+                            "invoice_id": invoice_id,
+                            "due_date": found[invoice_id]["due_date"],
+                            "allocated": Decimal("0").quantize(item_unit),
+                            "outstanding": due.quantize(item_unit),
+                        }
+                    )
+                    continue
+                allocated = remaining if remaining < due else due
                 if allocated > 0 and (allocated / item_unit) != (
                     allocated / item_unit
                 ).to_integral_value():
@@ -835,9 +867,16 @@ def allocate_payment(
                     f"来款分配后仍有余额 {format(remaining, 'f')} 未抵扣"
                 )
 
-            # 各发票分配额均已按各自精度校验，其和（= 整笔来款）是列表内最细最小
-            # 单位的整数倍；以该单位规范化展示，0 位发票批次即 "50" 而非 "50.00"
-            finest_unit = _minor_unit(max(digits_by_id.values()))
+            # 实际产生收款（allocated > 0）的各发票分配额均已按各自精度校验，
+            # 其和（= 整笔来款）是这些发票中最细最小单位的整数倍；以该单位
+            # 规范化展示，0 位发票批次即 "50" 而非 "50.00"。未实际抵扣的负额
+            # 冲红单/已结清发票（可能保存着更细或更粗的精度）不参与批次合计位数。
+            allocated_digits = [
+                digits_by_id[entry["invoice_id"]]
+                for entry in plan
+                if entry["allocated"] > 0
+            ]
+            finest_unit = _minor_unit(max(allocated_digits))
             canonical_amount = amount.quantize(finest_unit)
 
             created_at = utc_now_iso()
